@@ -1,0 +1,122 @@
+import backtrader as bt
+ 
+class VWAP(bt.Indicator):
+    lines = ('vwap',)
+    params = (('period', 60),)
+
+    def __init__(self):
+        self.addminperiod(self.p.period)
+
+    def next(self):
+        period = self.p.period
+        sum_vt = 0.0
+        sum_vol = 0.0
+        for i in range(-period + 1, 1):
+            typical = (self.data.high[i] + self.data.low[i] + self.data.close[i]) / 3.0
+            sum_vt += typical * self.data.volume[i]
+            sum_vol += self.data.volume[i]
+        self.lines.vwap[0] = sum_vt / sum_vol if sum_vol else self.data.close[0]
+
+class BladeBotStrategy(bt.Strategy):
+    params = (
+        ('rsi_period', 14),
+        ('vwap_period', 60),
+        ('rsi_bull_min', 55),
+        ('rsi_bear_max', 45),
+        # risk rules per trade (before applying our new limits)
+        ('max_loss_usd', 120.0),
+        ('take_profit_usd', 135.0),
+        ('value_per_point', 1.0),
+        ('volume', 0.04),
+        ('daily_max_drawdown', 650.0),
+    )
+
+    def __init__(self):
+        self.rsi = bt.indicators.RelativeStrengthIndex(self.data, period=self.p.rsi_period)
+        self.vwap = VWAP(self.data, period=self.p.vwap_period)
+        self.order = None
+        # Daily tracking variables
+        self.current_day = None
+        self.daily_drawdown = 0.0
+        self.trading_disabled = False
+
+    def next(self):
+        # Reset daily drawdown when a new day starts
+        current_dt = self.datas[0].datetime.date(0)
+        if self.current_day != current_dt:
+            self.current_day = current_dt
+            self.daily_drawdown = 0.0
+            self.trading_disabled = False
+            self.log(f"New day {self.current_day} - daily drawdown reset.")
+
+        if self.trading_disabled:
+            self.log("Max daily drawdown reached. Trading disabled for today.")
+            return
+
+        last = self.data.close[0]
+        r = self.rsi[0]
+        v = self.vwap[0]
+        signal = None
+        if last > v and r >= self.p.rsi_bull_min:
+            signal = "BUY"
+        elif last < v and r <= self.p.rsi_bear_max:
+            signal = "SELL"
+
+        if signal and not self.order:
+            stop_loss, take_profit = self.compute_brackets(last, signal, self.p.volume)
+            self.log(f"{signal} signal: entry {last:.2f}, SL {stop_loss:.2f}, TP {take_profit:.2f}")
+            if signal == "BUY":
+                self.order = self.buy_bracket(
+                    price=last,
+                    size=self.p.volume,
+                    stopprice=stop_loss,
+                    limitprice=take_profit
+                )
+            else:
+                self.order = self.sell_bracket(
+                    price=last,
+                    size=self.p.volume,
+                    stopprice=stop_loss,
+                    limitprice=take_profit
+                )
+
+    def compute_brackets(self, entry_price, signal, volume):
+        # Enforce a maximum risk of $160 for the stop loss and a minimum target of $120 for take profit.
+        # Even though the strategy parameters max_loss_usd and take_profit_usd are used in bracket math,
+        # here we override them with our new limits.
+        risk_dollars = min(self.p.max_loss_usd, 160.0)
+        target_dollars = max(self.p.take_profit_usd, 120.0)
+        risk_points = self.dollars_to_points(risk_dollars, volume, self.p.value_per_point)
+        target_points = self.dollars_to_points(target_dollars, volume, self.p.value_per_point)
+        if signal == "SELL":
+            stop_loss = entry_price + risk_points
+            take_profit = entry_price - target_points
+        else:
+            stop_loss = entry_price - risk_points
+            take_profit = entry_price + target_points
+        return stop_loss, take_profit
+
+    def dollars_to_points(self, dollars, volume, value_per_point_at_1vol):
+        denom = max(volume * value_per_point_at_1vol, 1e-9)
+        return dollars / denom
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin]:
+            self.order = None
+            self.log(f"Order completed, status: {order.Status[order.status]}")
+
+    def notify_trade(self, trade):
+        if not trade.isclosed:
+            return
+        pnl = trade.pnl
+        if pnl < 0:
+            loss = abs(pnl)
+            self.daily_drawdown += loss
+            self.log(f"Trade loss: {loss:.2f} | Cumulative daily drawdown: {self.daily_drawdown:.2f}")
+            if self.daily_drawdown >= self.p.daily_max_drawdown:
+                self.trading_disabled = True
+                self.log("Max daily drawdown reached. Disabling trading for today.")
+
+    def log(self, txt):
+        dt = self.datas[0].datetime.datetime(0)
+        print(f"{dt.isoformat()} {txt}")
